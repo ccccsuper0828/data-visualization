@@ -13,11 +13,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import base64
 import numpy as np
 import pandas as pd
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.events import DocumentReady
 from bokeh.models import (
     BasicTicker,
     Button,
@@ -45,6 +45,7 @@ from bokeh.transform import cumsum
 
 BASE_PATH = Path(__file__).resolve().parent
 DATA_PATH = BASE_PATH / "globalterrorismdb_0718dist.zip"
+BACKGROUND_IMAGE_PATH = BASE_PATH / "image.png"
 TABLEAU_IFRAME_URL = (
     "https://public.tableau.com/views/same_17638730129700/1"
     "?:embed=yes&:showVizHome=no&:tabs=no&:toolbar=yes&:animate_transition=yes"
@@ -68,6 +69,32 @@ PERIOD_LABELS = [
 ]
 FOCUS_REGIONS = ["Middle East & North Africa", "South Asia", "Sub-Saharan Africa", "South America"]
 RECENT_YEAR_THRESHOLD = 2008
+REGION_ABBREV = {
+    "Middle East & North Africa": "MENA",
+    "South Asia": "SA",
+    "Sub-Saharan Africa": "SSA",
+    "South America": "SAM",
+    "Central America & Caribbean": "CAC",
+    "Southeast Asia": "SEA",
+    "Western Europe": "WEU",
+    "Eastern Europe": "EEU",
+    "North America": "NAM",
+    "East Asia": "EAS",
+    "Central Asia": "CA",
+    "Australasia & Oceania": "AUS",
+}
+
+
+def _load_bg_image(path: Path) -> str:
+    try:
+        with open(path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode("utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+BG_IMAGE_DATA = _load_bg_image(BACKGROUND_IMAGE_PATH)
+BG_STYLE = f"url('data:image/png;base64,{BG_IMAGE_DATA}')" if BG_IMAGE_DATA else "none"
 
 
 def to_mercator(lat: pd.Series, lon: pd.Series) -> Tuple[pd.Series, pd.Series]:
@@ -154,6 +181,7 @@ top_orgs = (
 top_target_types = data["targtype1_txt"].value_counts().head(8).index.tolist() or ["Unknown target"]
 region_palette = Category20[20]
 REGION_COLOR_MAP = {region: region_palette[i % len(region_palette)] for i, region in enumerate(regions)}
+ATTACK_COLOR_MAP = {attack: Category20[20][i % len(Category20[20])] for i, attack in enumerate(attack_types)}
 
 year_slider = RangeSlider(
     title="Year range",
@@ -313,6 +341,28 @@ table_source = ColumnDataSource(
         casualties=[],
     )
 )
+
+boxplot_source = ColumnDataSource(
+    data=dict(region=[], region_full=[], q1=[], q2=[], q3=[], lower=[], upper=[])
+)
+scatter_source = ColumnDataSource(
+    data=dict(
+        fatalities=[],
+        wounded=[],
+        casualties=[],
+        country=[],
+        city=[],
+        year=[],
+        attacktype=[],
+        size=[],
+    )
+)
+circle_source = ColumnDataSource(data=dict(category=[], incidents=[], casualties=[], size=[], color=[]))
+attack_region_source = ColumnDataSource(
+    data=dict(year=[], region=[], attack=[], incidents=[], color=[], alpha=[])
+)
+suicide_trend_source = ColumnDataSource(data=dict(year=[], rate=[]))
+tactic_success_source = ColumnDataSource(data=dict(attack=[], rate=[], color=[]))
 
 
 # Figures
@@ -633,6 +683,11 @@ region_stack_fig.varea_stack(
     legend_label=regions,
     source=region_stack_source,
 )
+region_stack_hover = HoverTool(
+    tooltips=[("Year", "@year"), ("Region", "$name"), ("Incidents", "@$name{0,0}")],
+    mode="vline",
+)
+region_stack_fig.add_tools(region_stack_hover)
 region_highlight_renderer = region_stack_fig.line(
     x="year",
     y="value",
@@ -741,22 +796,224 @@ attack_target_fig.xaxis.major_label_orientation = math.radians(35)
 weapon_share_colors = Category20[20]
 weapon_share_fig = figure(
     title="Weapon share over time",
-    height=320,
+    height=360,
     width=780,
     x_axis_label="Year",
     y_axis_label="Share of incidents",
     y_range=(0, 1),
     tools="pan,xwheel_zoom,reset,save",
 )
-weapon_share_fig.varea_stack(
+weapon_share_renderers = weapon_share_fig.varea_stack(
     stackers=top_weapon_types,
     x="year",
     color=weapon_share_colors[: len(top_weapon_types)],
     legend_label=top_weapon_types,
     source=weapon_share_source,
 )
+for weapon, renderer in zip(top_weapon_types, weapon_share_renderers):
+    renderer.name = weapon
 weapon_share_fig.legend.location = "top_left"
 weapon_share_fig.legend.click_policy = "hide"
+for weapon, renderer in zip(top_weapon_types, weapon_share_renderers):
+    weapon_share_fig.add_tools(
+        HoverTool(
+            renderers=[renderer],
+            tooltips=[
+                ("Year", "@year"),
+                ("Weapon", weapon),
+                ("Share", f"@{weapon}{{0.0%}}"),
+            ],
+            mode="vline",
+        )
+    )
+
+boxplot_fig = figure(
+    title="Regional fatalities distribution (boxplot)",
+    height=360,
+    width=600,
+    sizing_mode="stretch_width",
+    x_range=FactorRange(),
+    toolbar_location=None,
+)
+boxplot_fig.segment(x0="region", y0="upper", x1="region", y1="q3", source=boxplot_source, line_width=2)
+boxplot_fig.segment(x0="region", y0="lower", x1="region", y1="q1", source=boxplot_source, line_width=2)
+boxplot_fig.vbar(
+    x="region",
+    width=0.7,
+    top="q3",
+    bottom="q1",
+    source=boxplot_source,
+    fill_color="#E76F51",
+    fill_alpha=0.6,
+    line_color="#333",
+)
+boxplot_fig.segment(
+    x0="region",
+    y0="lower",
+    x1="region",
+    y1="upper",
+    source=boxplot_source,
+    line_color="#333",
+)
+boxplot_fig.scatter(
+    x="region",
+    y="q2",
+    size=8,
+    color="#1D3557",
+    source=boxplot_source,
+)
+box_hover = HoverTool(
+    tooltips=[
+        ("Region", "@region_full (@region)"),
+        ("Q1", "@q1{0.0}"),
+        ("Median", "@q2{0.0}"),
+        ("Q3", "@q3{0.0}"),
+        ("Lower whisker", "@lower{0.0}"),
+        ("Upper whisker", "@upper{0.0}"),
+    ]
+)
+boxplot_fig.add_tools(box_hover)
+
+scatter_fig = figure(
+    title="Event severity scatter (fatalities vs wounded)",
+    height=360,
+    width=600,
+    sizing_mode="stretch_width",
+    x_axis_label="Fatalities",
+    y_axis_label="Wounded",
+    tools="pan,wheel_zoom,reset,save",
+)
+scatter_renderer = scatter_fig.scatter(
+    x="fatalities",
+    y="wounded",
+    size="size",
+    source=scatter_source,
+    fill_color="#43AA8B",
+    fill_alpha=0.6,
+    line_color="#1b4332",
+)
+scatter_hover = HoverTool(
+    renderers=[scatter_renderer],
+    tooltips=[
+        ("Location", "@city, @country_txt"),
+        ("Year", "@year"),
+        ("Attack Type", "@attacktype"),
+        ("Fatalities", "@fatalities{0,0}"),
+        ("Wounded", "@wounded{0,0}"),
+        ("Total casualties", "@casualties{0,0}"),
+    ],
+)
+scatter_fig.add_tools(scatter_hover)
+
+circle_fig = figure(
+    title="Circle view: attack type impact",
+    height=360,
+    width=600,
+    sizing_mode="stretch_width",
+    toolbar_location=None,
+)
+circle_renderer = circle_fig.circle(
+    x="incidents",
+    y="casualties",
+    size="size",
+    source=circle_source,
+    color="color",
+    alpha=0.7,
+    line_color="#1f2933",
+)
+circle_hover = HoverTool(
+    renderers=[circle_renderer],
+    tooltips=[
+        ("Attack type", "@category"),
+        ("Incidents", "@incidents{0,0}"),
+        ("Casualties", "@casualties{0,0}"),
+    ],
+)
+circle_fig.add_tools(circle_hover)
+circle_fig.xaxis.axis_label = "Incidents"
+circle_fig.yaxis.axis_label = "Casualties"
+
+attack_region_fig = figure(
+    title="Dominant attack type by region and year",
+    height=360,
+    width=780,
+    sizing_mode="stretch_width",
+    x_axis_label="Year",
+    y_range=FactorRange(),
+    tools="pan,xwheel_zoom,reset,save",
+)
+attack_region_renderer = attack_region_fig.rect(
+    x="year",
+    y="region",
+    width=1,
+    height=0.9,
+    source=attack_region_source,
+    fill_color="color",
+    fill_alpha="alpha",
+    line_color=None,
+)
+attack_region_hover = HoverTool(
+    renderers=[attack_region_renderer],
+    tooltips=[
+        ("Region", "@region"),
+        ("Year", "@year"),
+        ("Dominant attack", "@attack"),
+        ("Incidents", "@incidents{0,0}"),
+    ],
+)
+attack_region_fig.add_tools(attack_region_hover)
+
+suicide_trend_fig = figure(
+    title="Suicide attack rate trend",
+    height=360,
+    width=600,
+    sizing_mode="stretch_width",
+    x_axis_label="Year",
+    y_axis_label="Suicide share",
+    tools="pan,xwheel_zoom,reset,save",
+)
+suicide_line = suicide_trend_fig.line(
+    x="year",
+    y="rate",
+    source=suicide_trend_source,
+    line_width=3,
+    color="#ef476f",
+)
+suicide_scatter = suicide_trend_fig.scatter(
+    x="year",
+    y="rate",
+    size=7,
+    color="#ef476f",
+    source=suicide_trend_source,
+)
+suicide_hover = HoverTool(
+    renderers=[suicide_scatter],
+    tooltips=[("Year", "@year"), ("Suicide rate", "@rate{0.0%}")],
+    mode="vline",
+)
+suicide_trend_fig.add_tools(suicide_hover)
+
+tactic_success_fig = figure(
+    title="Success rate by attack tactic",
+    height=360,
+    width=600,
+    sizing_mode="stretch_width",
+    y_range=FactorRange(),
+    x_axis_label="Success rate",
+    toolbar_location=None,
+)
+tactic_renderer = tactic_success_fig.hbar(
+    y="attack",
+    right="rate",
+    height=0.6,
+    source=tactic_success_source,
+    color="color",
+)
+tactic_hover = HoverTool(
+    renderers=[tactic_renderer],
+    tooltips=[("Attack type", "@attack"), ("Success rate", "@rate{0.0%}")],
+)
+tactic_success_fig.add_tools(tactic_hover)
 
 org_colors = Category20[20]
 org_trend_fig = figure(
@@ -767,15 +1024,29 @@ org_trend_fig = figure(
     y_axis_label="Incidents",
     tools="pan,xwheel_zoom,reset,save",
 )
-org_trend_fig.varea_stack(
+org_renderers = org_trend_fig.varea_stack(
     stackers=top_orgs,
     x="year",
     color=org_colors[: len(top_orgs)],
     legend_label=top_orgs,
     source=org_trend_source,
 )
+for org_name, renderer in zip(top_orgs, org_renderers):
+    renderer.name = org_name
 org_trend_fig.legend.location = "top_left"
 org_trend_fig.legend.click_policy = "hide"
+for org_name, renderer in zip(top_orgs, org_renderers):
+    org_trend_fig.add_tools(
+        HoverTool(
+            renderers=[renderer],
+            tooltips=[
+                ("Year", "@year"),
+                ("Organization", org_name),
+                ("Incidents", f"@{org_name}{{0,0}}"),
+            ],
+            mode="vline",
+        )
+    )
 
 target_severity_fig = figure(
     title="Target severity (killed vs wounded)",
@@ -1344,6 +1615,151 @@ def update_success_split(subset: pd.DataFrame) -> None:
     )
 
 
+def update_boxplot(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        boxplot_source.data = {key: [] for key in boxplot_source.data}
+        boxplot_fig.x_range.factors = []
+        return
+    stats = []
+    for region, values in subset.groupby("region_txt")["nkill"]:
+        clean = values.replace([np.inf, -np.inf], np.nan).dropna()
+        if clean.empty:
+            continue
+        q1, median, q3 = clean.quantile([0.25, 0.5, 0.75])
+        iqr = q3 - q1
+        lower = max(clean.min(), q1 - 1.5 * iqr)
+        upper = min(clean.max(), q3 + 1.5 * iqr)
+        abbrev = REGION_ABBREV.get(region, "".join(word[0].upper() for word in region.split()))
+        stats.append(
+            dict(
+                region=abbrev,
+                region_full=region,
+                q1=q1,
+                q2=median,
+                q3=q3,
+                lower=lower,
+                upper=upper,
+            )
+        )
+    if not stats:
+        boxplot_source.data = {key: [] for key in boxplot_source.data}
+        boxplot_fig.x_range.factors = []
+        return
+    stats_df = pd.DataFrame(stats).sort_values("region_full")
+    boxplot_source.data = stats_df.to_dict(orient="list")
+    boxplot_fig.x_range.factors = stats_df["region"].tolist()
+
+
+def update_scatter(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        scatter_source.data = {key: [] for key in scatter_source.data}
+        return
+    scatter_df = (
+        subset.sort_values("casualties", ascending=False)
+        .head(500)[
+            ["nkill", "nwound", "casualties", "country_txt", "city", "iyear", "attacktype1_txt"]
+        ]
+        .rename(
+            columns={
+                "nkill": "fatalities",
+                "nwound": "wounded",
+                "iyear": "year",
+                "attacktype1_txt": "attacktype",
+            }
+        )
+    )
+    min_c, max_c = scatter_df["casualties"].min(), scatter_df["casualties"].max()
+    scatter_df["casualties"] = scatter_df["casualties"].astype(float)
+    if max_c == min_c:
+        scatter_df["size"] = 15
+    else:
+        scatter_df["size"] = np.interp(scatter_df["casualties"], [min_c, max_c], [8, 35])
+    scatter_source.data = scatter_df.to_dict(orient="list")
+
+
+def update_circle_view(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        circle_source.data = {key: [] for key in circle_source.data}
+        return
+    attack_summary = (
+        subset.groupby("attacktype1_txt")
+        .agg(incidents=("eventid", "count"), casualties=("casualties", "sum"))
+        .sort_values("incidents", ascending=False)
+        .head(10)
+        .reset_index()
+        .rename(columns={"attacktype1_txt": "category"})
+    )
+    max_casualty = max(attack_summary["casualties"].max(), 1)
+    attack_summary["size"] = np.interp(attack_summary["casualties"], [0, max_casualty], [15, 60])
+    attack_summary["color"] = attack_summary["category"].map(ATTACK_COLOR_MAP)
+    circle_source.data = attack_summary.to_dict(orient="list")
+
+
+def update_attack_region(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        attack_region_source.data = {key: [] for key in attack_region_source.data}
+        attack_region_fig.y_range.factors = []
+        return
+    agg = (
+        subset.groupby(["iyear", "region_txt", "attacktype1_txt"])
+        .agg(incidents=("eventid", "count"))
+        .reset_index()
+    )
+    dominant = (
+        agg.sort_values("incidents", ascending=False)
+        .groupby(["iyear", "region_txt"])
+        .head(1)
+        .reset_index(drop=True)
+    )
+    dominant["color"] = dominant["attacktype1_txt"].map(ATTACK_COLOR_MAP)
+    min_inc, max_inc = dominant["incidents"].min(), dominant["incidents"].max()
+    if max_inc == min_inc:
+        dominant["alpha"] = 0.8
+    else:
+        dominant["alpha"] = np.interp(dominant["incidents"], [min_inc, max_inc], [0.4, 0.95])
+    attack_region_source.data = dominant.rename(
+        columns={"iyear": "year", "region_txt": "region", "attacktype1_txt": "attack"}
+    ).to_dict(orient="list")
+    attack_region_fig.y_range.factors = sorted(dominant["region_txt"].unique().tolist())
+    attack_region_fig.x_range.start = dominant["iyear"].min() - 1
+    attack_region_fig.x_range.end = dominant["iyear"].max() + 1
+
+
+def update_suicide_trend(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        suicide_trend_source.data = {key: [] for key in suicide_trend_source.data}
+        return
+    yearly = (
+        subset.groupby("iyear")
+        .agg(
+            incidents=("eventid", "count"),
+            suicide_incidents=("suicide_flag", lambda s: (s == "Suicide").sum()),
+        )
+        .reset_index()
+        .rename(columns={"iyear": "year"})
+    )
+    yearly["rate"] = yearly["suicide_incidents"] / yearly["incidents"]
+    suicide_trend_source.data = yearly[["year", "rate"]].to_dict(orient="list")
+    suicide_trend_fig.x_range.start = yearly["year"].min()
+    suicide_trend_fig.x_range.end = yearly["year"].max()
+
+
+def update_tactic_success(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        tactic_success_source.data = {key: [] for key in tactic_success_source.data}
+        tactic_success_fig.y_range.factors = []
+        return
+    success = (
+        subset.groupby("attacktype1_txt")
+        .agg(rate=("success", "mean"))
+        .reset_index()
+        .sort_values("rate", ascending=False)
+    )
+    success["color"] = success["attacktype1_txt"].map(ATTACK_COLOR_MAP)
+    tactic_success_source.data = success.rename(columns={"attacktype1_txt": "attack"}).to_dict(orient="list")
+    tactic_success_fig.y_range.factors = success["attacktype1_txt"].tolist()
+
+
 def update_table(subset: pd.DataFrame) -> None:
     if subset.empty:
         table_source.data = {key: [] for key in table_source.data.keys()}
@@ -1377,16 +1793,57 @@ def update_summary(subset: pd.DataFrame) -> None:
     suicide_rate = subset["suicide_flag"].eq("Suicide").mean() if incident_count else 0
     avg_fatalities = subset["nkill"].mean() if incident_count else 0
     avg_wounded = subset["nwound"].mean() if incident_count else 0
+    metrics = [
+        ("Incidents", f"{incident_count:,}"),
+        ("Fatalities", f"{fatalities:,}"),
+        ("Wounded", f"{wounded:,}"),
+        ("Casualties", f"{casualties:,}"),
+        ("Success rate", f"{success_rate:0.1%}"),
+        ("Suicide share", f"{suicide_rate:0.1%}"),
+        ("Avg killed/event", f"{avg_fatalities:0.2f}"),
+        ("Avg wounded/event", f"{avg_wounded:0.2f}"),
+    ]
+    cards_html = "".join(
+        [
+            f"""
+            <div class='summary-card'>
+                <div class='summary-label'>{label}</div>
+                <div class='summary-value'>{value}</div>
+            </div>
+            """
+            for label, value in metrics
+        ]
+    )
     summary_div.text = f"""
-        <div style='display:flex; gap:18px; flex-wrap:wrap;'>
-            <div><strong>Incidents</strong><br>{incident_count:,}</div>
-            <div><strong>Fatalities</strong><br>{fatalities:,}</div>
-            <div><strong>Wounded</strong><br>{wounded:,}</div>
-            <div><strong>Casualties</strong><br>{casualties:,}</div>
-            <div><strong>Success rate</strong><br>{success_rate:0.1%}</div>
-            <div><strong>Suicide share</strong><br>{suicide_rate:0.1%}</div>
-            <div><strong>Avg killed/event</strong><br>{avg_fatalities:0.2f}</div>
-            <div><strong>Avg wounded/event</strong><br>{avg_wounded:0.2f}</div>
+        <style>
+            .summary-grid {{
+                display: grid;
+                grid-template-columns: repeat(8, minmax(120px, 1fr));
+                gap: 12px;
+                width: 100%;
+            }}
+            .summary-card {{
+                background-color: rgba(10, 14, 23, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 10px;
+                padding: 12px 16px;
+                color: #f1f5f9;
+                box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+            }}
+            .summary-label {{
+                font-size: 13px;
+                letter-spacing: 0.3px;
+                color: #e2e8f0;
+                text-transform: uppercase;
+            }}
+            .summary-value {{
+                font-size: 24px;
+                font-weight: 600;
+                margin-top: 4px;
+            }}
+        </style>
+        <div class='summary-grid'>
+            {cards_html}
         </div>
     """
 
@@ -1410,6 +1867,12 @@ def update_dashboard() -> None:
     update_org_trend(subset)
     update_target_severity(subset)
     update_success_split(subset)
+    update_boxplot(subset)
+    update_scatter(subset)
+    update_circle_view(subset)
+    update_attack_region(subset)
+    update_suicide_trend(subset)
+    update_tactic_success(subset)
     update_table(subset)
     update_summary(subset)
 
@@ -1527,7 +1990,7 @@ attack_target_card = column(
     Div(text="<b>Attack Type vs Target Matrix</b>"),
     attack_target_fig,
     sizing_mode="stretch_width",
-    styles={**CARD_STYLE, "gap": "6px"},
+    styles={**CARD_STYLE, "gap": "6px", "height": "100%"},
 )
 
 tableau_card = column(
@@ -1541,7 +2004,7 @@ weapon_share_card = column(
     Div(text="<b>Weapon Share Time Series</b>"),
     weapon_share_fig,
     sizing_mode="stretch_width",
-    styles={**CARD_STYLE, "gap": "6px"},
+    styles={**CARD_STYLE, "gap": "6px", "height": "100%"},
 )
 
 org_card = column(
@@ -1562,19 +2025,61 @@ heatmap_card = column(
     Div(text="<b>Decade × Region Heatmap</b>"),
     heatmap_fig,
     sizing_mode="stretch_width",
-    styles={**CARD_STYLE, "gap": "6px"},
+    styles={**CARD_STYLE, "gap": "6px", "height": "100%"},
 )
 
 table_card = column(
     Div(text="<b>Highest Casualty Events</b>"),
     table,
     sizing_mode="stretch_width",
-    styles={**CARD_STYLE, "gap": "6px"},
+    styles={**CARD_STYLE, "gap": "6px", "height": "100%"},
 )
 
 region_stack_card = column(
     Div(text="<b>Regional Stacked Area</b>"),
     region_stack_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+boxplot_card = column(
+    Div(text="<b>Fatalities distribution by region</b>"),
+    boxplot_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+scatter_card = column(
+    Div(text="<b>Event severity scatter</b>"),
+    scatter_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+circle_card = column(
+    Div(text="<b>Circle view: attack impact</b>"),
+    circle_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+attack_region_card = column(
+    Div(text="<b>Dominant attack types by region & year</b>"),
+    attack_region_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+suicide_card = column(
+    Div(text="<b>Deep insight · Suicide trend</b>"),
+    suicide_trend_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+tactic_card = column(
+    Div(text="<b>Deep insight · Tactic success</b>"),
+    tactic_success_fig,
     sizing_mode="stretch_width",
     styles={**CARD_STYLE, "gap": "6px"},
 )
@@ -1611,38 +2116,54 @@ extra_section = row(
     styles={"gap": "14px"},
 )
 
-advanced_section = column(
-    attack_target_card,
-    weapon_share_card,
-    org_card,
-    severity_card,
-    heatmap_card,
-    table_card,
+deep_insight_section = row(
+    suicide_card,
+    tactic_card,
     sizing_mode="stretch_width",
     styles={"gap": "14px"},
 )
 
+post_tableau_section = column(
+    row(boxplot_card, scatter_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(circle_card, attack_region_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(weapon_share_card, attack_target_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(org_card, severity_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(heatmap_card, table_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    sizing_mode="stretch_width",
+    styles={"gap": "16px"},
+)
+
 header = Div(
     text="""
-        <div style='display:flex; flex-direction:column; gap:4px; margin-bottom:10px;'>
-            <div style='display:flex; justify-content:space-between; align-items:center;'>
-                <div>
-                    <h2 style='margin:0;'>Global Terrorism Intelligence Dashboard</h2>
-                    <p style='margin:0; color:#4b5563;'>
-                        Interactive multi-perspective dashboard visualizing global terrorism incidents (1970-2017).
-                    </p>
-                </div>
+        <div style='display:flex; flex-direction:column; gap:4px; margin-bottom:10px; color:#f8fafc;'>
+            <div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;'>
+                <h2 style='margin:0; font-weight:600;'>Global Terrorism Intelligence Dashboard</h2>
+                <p style='margin:0; color:#cbd5f5;'>
+                    Interactive multi-perspective dashboard visualizing global terrorism incidents (1970-2017).
+                </p>
             </div>
         </div>
     """,
     sizing_mode="stretch_width",
-    styles={**CARD_STYLE, "gap": "4px", "padding-bottom": "2px"},
+    styles={
+        **CARD_STYLE,
+        "gap": "4px",
+        "padding-bottom": "2px",
+        "background-color": "rgba(15,17,25,0.85)",
+        "border": "1px solid rgba(255,255,255,0.15)",
+    },
 )
 
 summary_card = column(
     summary_div,
     sizing_mode="stretch_width",
-    styles={**CARD_STYLE, "padding": "10px", "background-color": "#ffffff"},
+    styles={
+        "padding": "0",
+        "background-color": "transparent",
+        "box-shadow": "none",
+        "border": "none",
+        "width": "100%",
+    },
 )
 
 dashboard = column(
@@ -1652,10 +2173,19 @@ dashboard = column(
     mid_section,
     secondary_section,
     extra_section,
+    deep_insight_section,
     tableau_section,
-    advanced_section,
+    post_tableau_section,
     sizing_mode="stretch_width",
-    styles={"gap": "16px", "background-color": "#f4f7fb", "padding": "16px"},
+    styles={
+        "gap": "12px",
+        "background-color": "#010409",
+        "background-image": BG_STYLE,
+        "background-size": "contain",
+        "background-position": "center top",
+        "background-repeat": "no-repeat",
+        "padding": "16px",
+    },
 )
 curdoc().add_root(dashboard)
 
