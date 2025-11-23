@@ -81,7 +81,27 @@ def to_mercator(lat: pd.Series, lon: pd.Series) -> Tuple[pd.Series, pd.Series]:
 @lru_cache(maxsize=1)
 def load_data() -> pd.DataFrame:
     """Load and enrich the dataset."""
-    df = pd.read_csv(DATA_PATH, encoding="latin1", low_memory=False)
+    use_cols = [
+        "iyear",
+        "imonth",
+        "iday",
+        "eventid",
+        "country_txt",
+        "region_txt",
+        "provstate",
+        "city",
+        "latitude",
+        "longitude",
+        "success",
+        "suicide",
+        "attacktype1_txt",
+        "targtype1_txt",
+        "gname",
+        "weaptype1_txt",
+        "nkill",
+        "nwound",
+    ]
+    df = pd.read_csv(DATA_PATH, encoding="latin1", low_memory=False, usecols=use_cols)
     df["imonth"] = df["imonth"].replace(0, 1)
     df["iday"] = df["iday"].replace(0, 1)
     df["event_date"] = pd.to_datetime(
@@ -1434,7 +1454,6 @@ controls = column(
 map_card = column(
     Div(text="<b>Global Spatial Distribution</b>", styles={"margin-bottom": "4px"}),
     map_fig,
-    summary_div,
     sizing_mode="stretch_width",
     styles={**CARD_STYLE, "gap": "10px"},
 )
@@ -1605,18 +1624,30 @@ advanced_section = column(
 
 header = Div(
     text="""
-        <div style='display:flex; flex-direction:column; gap:4px;'>
-            <h2 style='margin:0;'>Global Terrorism Intelligence Dashboard</h2>
-            <p style='margin:0; color:#4b5563;'>
-                Interactive multi-perspective dashboard visualizing global terrorism incidents (1970-2017) covering time, space, weapons, and targets.
-            </p>
+        <div style='display:flex; flex-direction:column; gap:4px; margin-bottom:10px;'>
+            <div style='display:flex; justify-content:space-between; align-items:center;'>
+                <div>
+                    <h2 style='margin:0;'>Global Terrorism Intelligence Dashboard</h2>
+                    <p style='margin:0; color:#4b5563;'>
+                        Interactive multi-perspective dashboard visualizing global terrorism incidents (1970-2017).
+                    </p>
+                </div>
+            </div>
         </div>
     """,
-    styles={**CARD_STYLE, "gap": "4px"},
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "4px", "padding-bottom": "2px"},
+)
+
+summary_card = column(
+    summary_div,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "padding": "10px", "background-color": "#ffffff"},
 )
 
 dashboard = column(
     header,
+    summary_card,
     top_section,
     mid_section,
     secondary_section,
