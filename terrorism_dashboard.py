@@ -33,15 +33,23 @@ from bokeh.models import (
     LinearColorMapper,
     MultiSelect,
     NumberFormatter,
+    NumeralTickFormatter,
     Range1d,
     RangeSlider,
     Select,
     TableColumn,
     WMTSTileSource,
+    GraphRenderer,
+    StaticLayoutProvider,
+    GraphRenderer,
+    StaticLayoutProvider,
+    MultiLine,
+    Circle,
 )
 from bokeh.palettes import Turbo256, Category10, Category20
-from bokeh.plotting import figure
+from bokeh.plotting import figure, from_networkx
 from bokeh.transform import cumsum
+import networkx as nx
 
 BASE_PATH = Path(__file__).resolve().parent
 DATA_PATH = BASE_PATH / "globalterrorismdb_0718dist.zip"
@@ -83,6 +91,12 @@ REGION_ABBREV = {
     "Central Asia": "CA",
     "Australasia & Oceania": "AUS",
 }
+
+def _smooth_curve(x0: float, y0: float, x1: float, y1: float, offset: float = 0.0) -> Tuple[List[float], List[float]]:
+    steps = np.linspace(0, 1, 25)
+    xs = x0 + (x1 - x0) * steps
+    ys = y0 + (y1 - y0) * steps + offset * steps * (1 - steps)
+    return xs.tolist(), ys.tolist()
 
 
 def _load_bg_image(path: Path) -> str:
@@ -179,6 +193,7 @@ top_orgs = (
     or ["Unknown group"]
 )
 top_target_types = data["targtype1_txt"].value_counts().head(8).index.tolist() or ["Unknown target"]
+top_attack_types = data["attacktype1_txt"].value_counts().head(6).index.tolist() or ["Unknown attack"]
 region_palette = Category20[20]
 REGION_COLOR_MAP = {region: region_palette[i % len(region_palette)] for i, region in enumerate(regions)}
 ATTACK_COLOR_MAP = {attack: Category20[20][i % len(Category20[20])] for i, attack in enumerate(attack_types)}
@@ -341,6 +356,24 @@ table_source = ColumnDataSource(
         casualties=[],
     )
 )
+
+region_share_source = ColumnDataSource(
+    data=dict(decade=[], **{region: [] for region in regions})
+)
+attack_share_source = ColumnDataSource(
+    data=dict(year=[], **{attack: [] for attack in top_attack_types})
+)
+attack_lethality_source = ColumnDataSource(
+    data=dict(attack=[], incidents=[], casualties=[], avg=[], size=[], color=[])
+)
+target_percent_source = ColumnDataSource(data=dict(year=[], **{target: [] for target in top_target_types}))
+sankey_edge_source = ColumnDataSource(
+    data=dict(xs=[], ys=[], line_width=[], color=[], label=[], incidents=[])
+)
+sankey_node_source = ColumnDataSource(data=dict(x=[], y=[], name=[], color=[], type=[], value=[]))
+org_network_source = ColumnDataSource(data=dict())
+org_split_source = ColumnDataSource(data=dict(year=[], organized=[], unorganized=[]))
+severity_dual_source = ColumnDataSource(data=dict(year=[], incidents=[], avg_casualties=[]))
 
 boxplot_source = ColumnDataSource(
     data=dict(region=[], region_full=[], q1=[], q2=[], q3=[], lower=[], upper=[])
@@ -676,7 +709,7 @@ region_stack_fig = figure(
     tools="pan,xwheel_zoom,reset,save",
 )
 stack_colors = [REGION_COLOR_MAP[r] for r in regions]
-region_stack_fig.varea_stack(
+region_stack_renderers = region_stack_fig.varea_stack(
     stackers=regions,
     x="year",
     color=stack_colors,
@@ -684,7 +717,12 @@ region_stack_fig.varea_stack(
     source=region_stack_source,
 )
 region_stack_hover = HoverTool(
-    tooltips=[("Year", "@year"), ("Region", "$name"), ("Incidents", "@$name{0,0}")],
+    renderers=region_stack_renderers,
+    tooltips=[
+        ("Year", "$x{0}"),
+        ("Region", "$name"),
+        ("Incidents", "@$name{0,0}"),
+    ],
     mode="vline",
 )
 region_stack_fig.add_tools(region_stack_hover)
@@ -932,6 +970,230 @@ circle_hover = HoverTool(
 circle_fig.add_tools(circle_hover)
 circle_fig.xaxis.axis_label = "Incidents"
 circle_fig.yaxis.axis_label = "Casualties"
+
+region_share_fig = figure(
+    title="Regional share by decade",
+    height=380,
+    width=700,
+    x_range=FactorRange(),
+    y_range=(0, 1),
+    toolbar_location=None,
+)
+region_share_renderers = region_share_fig.vbar_stack(
+    stackers=regions,
+    x="decade",
+    width=0.8,
+    color=[REGION_COLOR_MAP[r] for r in regions],
+    legend_label=regions,
+    source=region_share_source,
+)
+region_share_fig.yaxis.formatter = NumeralTickFormatter(format="0%")
+region_share_fig.legend.click_policy = "mute"
+region_share_hover = HoverTool(
+    renderers=region_share_renderers,
+    tooltips=[
+        ("Decade", "@decade"),
+        ("Region", "$name"),
+        ("Share", "@$name{0.0%}"),
+    ],
+)
+region_share_fig.add_tools(region_share_hover)
+
+attack_share_fig = figure(
+    title="Attack type share over time",
+    height=360,
+    width=780,
+    x_axis_label="Year",
+    y_axis_label="Share of incidents",
+    tools="pan,xwheel_zoom,reset,save",
+)
+attack_share_renderers = attack_share_fig.varea_stack(
+    stackers=top_attack_types,
+    x="year",
+    color=[ATTACK_COLOR_MAP[t] for t in top_attack_types],
+    legend_label=top_attack_types,
+    source=attack_share_source,
+)
+attack_share_fig.legend.location = "top_left"
+attack_share_fig.legend.click_policy = "hide"
+attack_share_hover = HoverTool(
+    renderers=attack_share_renderers,
+    tooltips=[("Year", "$x{0}"), ("Attack", "$name"), ("Share", "@$name{0.0%}")],
+    mode="vline",
+)
+attack_share_fig.add_tools(attack_share_hover)
+
+attack_lethality_fig = figure(
+    title="Attack method lethality",
+    height=360,
+    width=600,
+    x_axis_label="Incidents",
+    y_axis_label="Casualties",
+    tools="pan,wheel_zoom,reset,save",
+)
+attack_lethality_renderer = attack_lethality_fig.scatter(
+    x="incidents",
+    y="casualties",
+    size="size",
+    color="color",
+    alpha=0.7,
+    source=attack_lethality_source,
+)
+attack_lethality_hover = HoverTool(
+    renderers=[attack_lethality_renderer],
+    tooltips=[
+        ("Attack type", "@attack"),
+        ("Incidents", "@incidents{0,0}"),
+        ("Casualties", "@casualties{0,0}"),
+        ("Avg casualties/event", "@avg{0.0}"),
+    ],
+)
+attack_lethality_fig.add_tools(attack_lethality_hover)
+
+target_percent_fig = figure(
+    title="Target distribution over time",
+    height=360,
+    width=780,
+    x_axis_label="Year",
+    y_axis_label="Share",
+    tools="pan,xwheel_zoom,reset,save",
+)
+target_percent_renderers = target_percent_fig.varea_stack(
+    stackers=top_target_types,
+    x="year",
+    color=[Category20[20][i % 20] for i in range(len(top_target_types))],
+    legend_label=top_target_types,
+    source=target_percent_source,
+)
+target_percent_fig.legend.location = "top_left"
+target_percent_fig.legend.click_policy = "hide"
+target_percent_hover = HoverTool(
+    renderers=target_percent_renderers,
+    tooltips=[("Year", "$x{0}"), ("Target", "$name"), ("Share", "@$name{0.0%}")],
+    mode="vline",
+)
+target_percent_fig.add_tools(target_percent_hover)
+
+sankey_fig = figure(
+    title="Attack → Target → Outcome flow",
+    height=420,
+    width=780,
+    x_range=(-0.2, 2.2),
+    y_range=(-0.5, 12.5),
+    toolbar_location=None,
+)
+sankey_edge_renderer = sankey_fig.multi_line(
+    xs="xs",
+    ys="ys",
+    line_width="line_width",
+    color="color",
+    alpha=0.6,
+    source=sankey_edge_source,
+)
+sankey_node_renderer = sankey_fig.circle(
+    x="x",
+    y="y",
+    size=18,
+    color="color",
+    alpha=0.9,
+    source=sankey_node_source,
+)
+sankey_node_hover = HoverTool(
+    renderers=[sankey_node_renderer],
+    tooltips=[("Node", "@name"), ("Type", "@type"), ("Value", "@value{0,0}")],
+)
+sankey_edge_hover = HoverTool(
+    renderers=[sankey_edge_renderer],
+    tooltips=[("Flow", "@label"), ("Incidents", "@incidents{0,0}")],
+)
+sankey_fig.add_tools(sankey_node_hover, sankey_edge_hover)
+
+org_network_fig = figure(
+    title="Organization relationship network",
+    height=520,
+    width=720,
+    x_range=(-2.0, 2.0),
+    y_range=(-2.0, 2.0),
+    toolbar_location=None,
+)
+org_graph = GraphRenderer()
+org_graph.node_renderer.glyph = Circle(radius=0.05, fill_color="color")
+org_graph.edge_renderer.glyph = MultiLine(line_color="line_color", line_alpha=0.6, line_width="line_width")
+org_graph.layout_provider = StaticLayoutProvider(graph_layout={})
+org_network_fig.renderers.append(org_graph)
+org_network_node_hover = HoverTool(
+    renderers=[org_graph.node_renderer],
+    tooltips=[("Node", "@label"), ("Type", "@type"), ("Incidents", "@value{0,0}")],
+)
+org_network_fig.add_tools(org_network_node_hover)
+
+org_split_fig = figure(
+    title="Organized vs unaffiliated trend",
+    height=360,
+    width=780,
+    x_axis_label="Year",
+    y_axis_label="Incidents",
+    tools="pan,xwheel_zoom,reset,save",
+)
+organized_line = org_split_fig.line(
+    x="year",
+    y="organized",
+    color="#1d3557",
+    line_width=3,
+    source=org_split_source,
+    legend_label="Organized",
+)
+unorganized_line = org_split_fig.line(
+    x="year",
+    y="unorganized",
+    color="#e76f51",
+    line_width=3,
+    source=org_split_source,
+    legend_label="Unaffiliated",
+)
+org_split_fig.legend.location = "top_left"
+org_split_hover = HoverTool(
+    renderers=[organized_line, unorganized_line],
+    tooltips=[("Year", "@year"), ("Incidents", "$y{0,0}")],
+    mode="vline",
+)
+org_split_fig.add_tools(org_split_hover)
+
+severity_dual_fig = figure(
+    title="Incident vs average casualties",
+    height=360,
+    width=780,
+    x_axis_label="Year",
+    y_axis_label="Incidents",
+    tools="pan,xwheel_zoom,reset,save",
+)
+severity_dual_fig.extra_y_ranges = {"avg": Range1d(start=0, end=5)}
+severity_dual_fig.add_layout(LinearAxis(y_range_name="avg", axis_label="Avg casualties per event"), "right")
+severity_incidents = severity_dual_fig.line(
+    x="year",
+    y="incidents",
+    color="#2196f3",
+    line_width=3,
+    source=severity_dual_source,
+)
+severity_avg = severity_dual_fig.line(
+    x="year",
+    y="avg_casualties",
+    color="#f44336",
+    line_width=3,
+    y_range_name="avg",
+    source=severity_dual_source,
+)
+severity_hover = HoverTool(
+    renderers=[severity_incidents, severity_avg],
+    tooltips=[
+        ("Year", "@year"),
+        ("Incidents", "@incidents{0,0}"),
+        ("Avg casualty/event", "@avg_casualties{0.00}"),
+    ],
+    mode="vline",
+)
+severity_dual_fig.add_tools(severity_hover)
 
 attack_region_fig = figure(
     title="Dominant attack type by region and year",
@@ -1615,6 +1877,303 @@ def update_success_split(subset: pd.DataFrame) -> None:
     )
 
 
+def update_region_share(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        region_share_source.data = {"decade": []}
+        return
+    share_df = subset.copy()
+    share_df["decade"] = (share_df["iyear"] // 10) * 10
+    share_df = share_df.dropna(subset=["decade"])
+    decade_order = sorted(share_df["decade"].unique())
+    data = {"decade": [str(int(d)) for d in decade_order]}
+    grouped = share_df.groupby(["decade", "region_txt"]).size().rename("incidents").reset_index()
+    totals = grouped.groupby("decade")["incidents"].transform("sum")
+    grouped["share"] = grouped["incidents"] / totals
+    for region in regions:
+        values = []
+        for d in decade_order:
+            row = grouped[(grouped["decade"] == d) & (grouped["region_txt"] == region)]
+            values.append(row["share"].iloc[0] if not row.empty else 0.0)
+        data[region] = values
+    region_share_source.data = data
+    region_share_fig.x_range.factors = data["decade"]
+
+
+def update_attack_share(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        attack_share_source.data = {"year": []}
+        return
+    share = (
+        subset[subset["attacktype1_txt"].isin(top_attack_types)]
+        .groupby(["iyear", "attacktype1_txt"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(columns=top_attack_types, fill_value=0)
+        .sort_index()
+    )
+    totals = share.sum(axis=1).replace(0, 1)
+    share = share.div(totals, axis=0)
+    data = {"year": share.index.tolist()}
+    for attack in top_attack_types:
+        data[attack] = share[attack].tolist()
+    attack_share_source.data = data
+
+
+def update_attack_lethality(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        attack_lethality_source.data = dict(attack=[], incidents=[], casualties=[], avg=[], size=[], color=[])
+        return
+    agg = (
+        subset.groupby("attacktype1_txt")
+        .agg(incidents=("eventid", "count"), casualties=("casualties", "sum"))
+        .reset_index()
+        .rename(columns={"attacktype1_txt": "attack"})
+    )
+    agg["avg"] = agg["casualties"] / agg["incidents"]
+    max_avg = max(agg["avg"].max(), 1)
+    agg["size"] = np.interp(agg["avg"], [0, max_avg], [10, 50])
+    agg["color"] = agg["attack"].map(ATTACK_COLOR_MAP).fillna("#888888")
+    attack_lethality_source.data = agg.to_dict(orient="list")
+
+
+def update_target_percent(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        target_percent_source.data = {"year": []}
+        return
+    subset = subset[subset["targtype1_txt"].isin(top_target_types)]
+    share = (
+        subset.groupby(["iyear", "targtype1_txt"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(columns=top_target_types, fill_value=0)
+        .sort_index()
+    )
+    totals = share.sum(axis=1).replace(0, 1)
+    share = share.div(totals, axis=0)
+    data = {"year": share.index.tolist()}
+    for target in top_target_types:
+        data[target] = share[target].tolist()
+    target_percent_source.data = data
+
+
+def update_sankey(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        sankey_edge_source.data = dict(xs=[], ys=[], line_width=[], color=[], label=[], incidents=[])
+        sankey_node_source.data = dict(x=[], y=[], name=[], color=[], type=[], value=[])
+        return
+    top_attacks = subset["attacktype1_txt"].value_counts().head(5).index.tolist()
+    top_targets = subset["targtype1_txt"].value_counts().head(5).index.tolist()
+    outcomes = ["Successful", "Failed"]
+    gap = 1.8
+    def _positions(count: int) -> np.ndarray:
+        if count <= 1:
+            return np.array([0.0])
+        return np.linspace(0, (count - 1) * gap, count)
+    attack_nodes = list(zip([0.0] * len(top_attacks), _positions(len(top_attacks))))
+    target_nodes = list(zip([1.0] * len(top_targets), _positions(len(top_targets))))
+    outcome_nodes = list(zip([2.0] * len(outcomes), _positions(len(outcomes))))
+    all_y = [y for _, y in attack_nodes + target_nodes + outcome_nodes]
+    if all_y:
+        sankey_fig.y_range.start = min(all_y) - gap
+        sankey_fig.y_range.end = max(all_y) + gap
+    else:
+        sankey_fig.y_range.start = -gap
+        sankey_fig.y_range.end = gap
+    node_x = []
+    node_y = []
+    names = []
+    colors = []
+    palette = Category20[20]
+    for idx, (x, y) in enumerate(attack_nodes):
+        node_x.append(x)
+        node_y.append(y)
+        names.append(top_attacks[idx])
+        colors.append(palette[idx % 20])
+    for idx, (x, y) in enumerate(target_nodes):
+        node_x.append(x)
+        node_y.append(y)
+        names.append(top_targets[idx])
+        colors.append(palette[(idx + 5) % 20])
+    for idx, (x, y) in enumerate(outcome_nodes):
+        node_x.append(x)
+        node_y.append(y)
+        names.append(outcomes[idx])
+        colors.append(palette[(idx + 10) % 20])
+    values = []
+    types = []
+    attack_totals = (
+        subset[subset["attacktype1_txt"].isin(top_attacks)]
+        .groupby("attacktype1_txt")["eventid"]
+        .count()
+        .to_dict()
+    )
+    target_totals = (
+        subset[subset["targtype1_txt"].isin(top_targets)]
+        .groupby("targtype1_txt")["eventid"]
+        .count()
+        .to_dict()
+    )
+    outcome_totals = (
+        subset.groupby("success_flag")["eventid"].count().to_dict()
+    )
+    for idx in range(len(attack_nodes)):
+        attack = top_attacks[idx]
+        values.append(attack_totals.get(attack, 0))
+        types.append("Attack")
+    for idx in range(len(target_nodes)):
+        target = top_targets[idx]
+        values.append(target_totals.get(target, 0))
+        types.append("Target")
+    for idx in range(len(outcome_nodes)):
+        outcome = outcomes[idx]
+        values.append(outcome_totals.get(outcome, 0))
+        types.append("Outcome")
+    sankey_node_source.data = dict(x=node_x, y=node_y, name=names, color=colors, type=types, value=values)
+    xs = []
+    ys = []
+    widths = []
+    edge_colors = []
+    labels = []
+    incidents_list = []
+    attack_target = (
+        subset[subset["attacktype1_txt"].isin(top_attacks)]
+        .groupby(["attacktype1_txt", "targtype1_txt"])
+        .size()
+        .reset_index(name="incidents")
+    )
+    max_val = max(attack_target["incidents"].max(), 1) if not attack_target.empty else 1
+    for _, row in attack_target.iterrows():
+        if row["targtype1_txt"] not in top_targets:
+            continue
+        i_attack = top_attacks.index(row["attacktype1_txt"])
+        i_target = top_targets.index(row["targtype1_txt"])
+        offset = (i_target - len(top_targets) / 2) * 0.35
+        curve_x, curve_y = _smooth_curve(attack_nodes[i_attack][0], attack_nodes[i_attack][1], target_nodes[i_target][0], target_nodes[i_target][1], offset)
+        xs.append(curve_x)
+        ys.append(curve_y)
+        widths.append(2 + 10 * (row["incidents"] / max_val))
+        edge_colors.append(palette[i_attack % 20])
+        labels.append(f"{row['attacktype1_txt']} → {row['targtype1_txt']}")
+        incidents_list.append(row["incidents"])
+    target_outcome = (
+        subset[subset["targtype1_txt"].isin(top_targets)]
+        .groupby(["targtype1_txt", "success_flag"])
+        .size()
+        .reset_index(name="incidents")
+    )
+    max_val = max(target_outcome["incidents"].max(), 1) if not target_outcome.empty else 1
+    for _, row in target_outcome.iterrows():
+        if row["success_flag"] not in outcomes:
+            continue
+        if row["targtype1_txt"] not in top_targets:
+            continue
+        i_target = top_targets.index(row["targtype1_txt"])
+        i_outcome = outcomes.index(row["success_flag"])
+        offset = (i_outcome - len(outcomes) / 2) * 0.45
+        curve_x, curve_y = _smooth_curve(target_nodes[i_target][0], target_nodes[i_target][1], outcome_nodes[i_outcome][0], outcome_nodes[i_outcome][1], offset)
+        xs.append(curve_x)
+        ys.append(curve_y)
+        widths.append(2 + 10 * (row["incidents"] / max_val))
+        edge_colors.append(palette[(i_outcome + 10) % 20])
+        labels.append(f"{row['targtype1_txt']} → {row['success_flag']}")
+        incidents_list.append(row["incidents"])
+    sankey_edge_source.data = dict(
+        xs=xs,
+        ys=ys,
+        line_width=widths,
+        color=edge_colors,
+        label=labels,
+        incidents=incidents_list,
+    )
+
+
+def update_org_network(subset: pd.DataFrame) -> None:
+    filtered = subset[subset["gname"].isin(top_orgs) & subset["region_txt"].notna()]
+    if filtered.empty:
+        org_graph.node_renderer.data_source.data = dict(index=[], color=[], label=[], type=[], value=[])
+        org_graph.edge_renderer.data_source.data = dict(start=[], end=[], line_width=[], line_color=[])
+        org_graph.layout_provider.graph_layout = {}
+        return
+    G = nx.Graph()
+    for org in top_orgs:
+        G.add_node(f"ORG:{org}", color="#1d3557")
+    region_nodes = sorted(filtered["region_txt"].unique().tolist())
+    for region in region_nodes:
+        G.add_node(f"REG:{region}", color="#e76f51")
+    edges = (
+        filtered.groupby(["gname", "region_txt"])
+        .size()
+        .reset_index(name="incidents")
+    )
+    max_val = max(edges["incidents"].max(), 1)
+    for _, row in edges.iterrows():
+        G.add_edge(
+            f"ORG:{row['gname']}",
+            f"REG:{row['region_txt']}",
+            weight=2 + 8 * (row["incidents"] / max_val),
+        )
+    layout = nx.spring_layout(G, seed=42, k=0.7, scale=1.8)
+    org_totals = filtered.groupby("gname")["eventid"].count().to_dict()
+    region_totals = filtered.groupby("region_txt")["eventid"].count().to_dict()
+    node_labels = []
+    node_types = []
+    node_colors = []
+    node_values = []
+    for node in G.nodes():
+        if node.startswith("ORG:"):
+            node_labels.append(node.replace("ORG:", ""))
+            node_types.append("Organization")
+            node_values.append(org_totals.get(node.replace("ORG:", ""), 0))
+        else:
+            node_labels.append(node.replace("REG:", ""))
+            node_types.append("Region")
+            node_values.append(region_totals.get(node.replace("REG:", ""), 0))
+        node_colors.append(G.nodes[node]["color"])
+    org_graph.node_renderer.data_source.data = dict(
+        index=list(G.nodes()),
+        color=node_colors,
+        label=node_labels,
+        type=node_types,
+        value=node_values,
+    )
+    org_graph.edge_renderer.data_source.data = dict(
+        start=[edge[0] for edge in G.edges()],
+        end=[edge[1] for edge in G.edges()],
+        line_width=[G.edges[edge]["weight"] for edge in G.edges()],
+        line_color=["#94a3b8"] * len(G.edges()),
+    )
+    org_graph.layout_provider.graph_layout = layout
+
+
+def update_org_split(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        org_split_source.data = dict(year=[], organized=[], unorganized=[])
+        return
+    grouped = subset.groupby("iyear").agg(
+        organized=("gname", lambda s: s.ne("Unknown group").sum()),
+        total=("eventid", "count"),
+    )
+    grouped["unorganized"] = grouped["total"] - grouped["organized"]
+    grouped = grouped[["organized", "unorganized"]].reset_index().rename(columns={"iyear": "year"})
+    org_split_source.data = grouped.to_dict(orient="list")
+
+
+def update_severity_dual(subset: pd.DataFrame) -> None:
+    if subset.empty:
+        severity_dual_source.data = dict(year=[], incidents=[], avg_casualties=[])
+        return
+    grouped = (
+        subset.groupby("iyear")
+        .agg(incidents=("eventid", "count"), casualties=("casualties", "sum"))
+        .reset_index()
+        .rename(columns={"iyear": "year"})
+    )
+    grouped["avg_casualties"] = grouped["casualties"] / grouped["incidents"]
+    severity_dual_source.data = grouped[["year", "incidents", "avg_casualties"]].to_dict(orient="list")
+    if not grouped.empty:
+        severity_dual_fig.extra_y_ranges["avg"].start = 0
+        severity_dual_fig.extra_y_ranges["avg"].end = float(grouped["avg_casualties"].max() * 1.2)
+
 def update_boxplot(subset: pd.DataFrame) -> None:
     if subset.empty:
         boxplot_source.data = {key: [] for key in boxplot_source.data}
@@ -1873,6 +2432,14 @@ def update_dashboard() -> None:
     update_attack_region(subset)
     update_suicide_trend(subset)
     update_tactic_success(subset)
+    update_region_share(subset)
+    update_attack_share(subset)
+    update_attack_lethality(subset)
+    update_target_percent(subset)
+    update_sankey(subset)
+    update_org_network(subset)
+    update_org_split(subset)
+    update_severity_dual(subset)
     update_table(subset)
     update_summary(subset)
 
@@ -2070,6 +2637,62 @@ attack_region_card = column(
     styles={**CARD_STYLE, "gap": "6px"},
 )
 
+region_share_card = column(
+    Div(text="<b>Regional share by decade</b>"),
+    region_share_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+attack_share_card = column(
+    Div(text="<b>Attack type share over time</b>"),
+    attack_share_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+attack_lethality_card = column(
+    Div(text="<b>Attack method lethality</b>"),
+    attack_lethality_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+target_percent_card = column(
+    Div(text="<b>Target distribution over time</b>"),
+    target_percent_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+sankey_card = column(
+    Div(text="<b>Attack → Target → Outcome flow</b>"),
+    sankey_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+org_network_card = column(
+    Div(text="<b>Organization relationship network</b>"),
+    org_network_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+org_split_card = column(
+    Div(text="<b>Organized vs unaffiliated trend</b>"),
+    org_split_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
+severity_dual_card = column(
+    Div(text="<b>Incident vs average casualties</b>"),
+    severity_dual_fig,
+    sizing_mode="stretch_width",
+    styles={**CARD_STYLE, "gap": "6px"},
+)
+
 suicide_card = column(
     Div(text="<b>Deep insight · Suicide trend</b>"),
     suicide_trend_fig,
@@ -2124,6 +2747,10 @@ deep_insight_section = row(
 )
 
 post_tableau_section = column(
+    row(region_share_card, attack_share_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(attack_lethality_card, target_percent_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(sankey_card, org_network_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
+    row(org_split_card, severity_dual_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
     row(boxplot_card, scatter_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
     row(circle_card, attack_region_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
     row(weapon_share_card, attack_target_card, sizing_mode="stretch_width", styles={"gap": "14px"}),
